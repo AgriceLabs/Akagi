@@ -129,6 +129,8 @@
       - By clicking on the "Model" button in the bottom left corner.
       - Select a model from the list.
       - If you don't have a model, get it from [Discord](https://discord.gg/Z2wjXUK8bN).
+      - `mahjong_helper` uses the external `mahjong-helper` CLI on your PATH.
+        - Or set `MAHJONG_HELPER_BIN` and optionally `MAHJONG_HELPER_TIMEOUT_MS`.
       - Builtin default model is weak AI.
       - __Choose 3P model for 3P game!__
       - __Do not join 3P game with 4P model!__

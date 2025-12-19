@@ -45,7 +45,7 @@ class Controller(object):
         return bots
 
     def react(self, events: list[dict]) -> dict:
-        if settings.auto_switch_model:
+        if settings.auto_switch_model and settings.model in ("mortal", "mortal3p"):
             for event in events:
                 if event["type"] == "start_game":
                     self.starting_game = True

@@ -1,16 +1,13 @@
 import json
 import sys
 
-from . import model
 from .logger import logger
 
 class Bot:
     def __init__(self):
         self.player_id: int = None
         self.model = None
-        # ========== Online Server =========== #
-        model.online_settings_init()
-        # ==================================== #
+        self._model_module = None
 
     def react(self, events: str) -> str:
         """
@@ -76,7 +73,8 @@ class Bot:
         for e in events:
             if e["type"] == "start_game":
                 self.player_id = e["id"]
-                self.model = model.load_model(self.player_id)
+                model_module = self._get_model_module()
+                self.model = model_module.load_model(self.player_id)
                 continue
             if self.model is None or self.player_id is None:
                 logger.error(f"Model is not loaded yet")
@@ -89,11 +87,12 @@ class Bot:
 
         if return_action is None:
             # ========== Online Server =========== #
-            if model.ot_settings['online']:
+            model_module = self._model_module
+            if model_module and model_module.ot_settings['online']:
                 raw_data = {
                     "type":"none",
                     "meta": {
-                        "online": model.is_online
+                        "online": model_module.is_online
                     }
                 }
                 return_action = json.dumps(raw_data, separators=(",", ":"))
@@ -103,14 +102,15 @@ class Bot:
             return return_action
         else:
             # ========== Online Server =========== #
-            if model.ot_settings['online']:
+            model_module = self._model_module
+            if model_module and model_module.ot_settings['online']:
                 if "meta" in return_action:
                     raw_data = json.loads(return_action)
-                    raw_data["meta"]["online"] = model.is_online
+                    raw_data["meta"]["online"] = model_module.is_online
                     return_action = json.dumps(raw_data, separators=(",", ":"))
                 else:
                     raw_data = json.loads(return_action)
-                    raw_data["meta"] = {"online": model.is_online}
+                    raw_data["meta"] = {"online": model_module.is_online}
                     return_action = json.dumps(raw_data, separators=(",", ":"))
             # ==================================== #
             # raw_data = json.loads(return_action)
@@ -118,3 +118,9 @@ class Bot:
             # return json.dumps(raw_data, separators=(",", ":"))
             return return_action
 
+    def _get_model_module(self):
+        if self._model_module is None:
+            from . import model
+            model.online_settings_init()
+            self._model_module = model
+        return self._model_module

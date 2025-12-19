@@ -1,10 +1,10 @@
 {
     "mitm": {
-        "type": "majsoul",
-        "host": "127.0.0.1",
+        "type": "riichi_city",
+        "host": "192.168.1.22",
         "port": 7880
     },
-    "model": "mortal",
+    "model": "mahjong_helper",
     "theme": "textual-dark",
     "ot_server": {
         "server": "http://127.0.0.1:5000",
