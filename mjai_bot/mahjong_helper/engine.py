@@ -68,6 +68,7 @@ class DiscardCandidate:
     raw_line: str
     call_type: Optional[str] = None
     shanten: Optional[int] = None
+    no_yaku: bool = False
 
 
 @dataclass
@@ -76,6 +77,7 @@ class DiscardAnalysis:
     candidates: list[DiscardCandidate]
     analysis_text: Optional[str]
     raw_stdout: str
+    best_shanten: Optional[int]
 
 
 @dataclass
@@ -127,11 +129,12 @@ class MahjongHelperEngine:
         self,
         hand_tiles: Iterable[str],
         melds: Optional[Iterable[str]] = None,
+        dora_tiles: Optional[Iterable[str]] = None,
     ) -> DiscardAnalysis:
-        args = self._build_args(hand_tiles, melds=melds)
+        args = self._build_args(hand_tiles, melds=melds, dora_tiles=dora_tiles)
         stdout = self._run(args)
         if stdout is None:
-            return DiscardAnalysis(None, [], None, "")
+            return DiscardAnalysis(None, [], None, "", None)
         return self.parse_discard_output(stdout)
 
     def analyze_call(
@@ -139,8 +142,14 @@ class MahjongHelperEngine:
         hand_tiles: Iterable[str],
         called_tile: str,
         melds: Optional[Iterable[str]] = None,
+        dora_tiles: Optional[Iterable[str]] = None,
     ) -> CallAnalysis:
-        args = self._build_args(hand_tiles, melds=melds, called_tile=called_tile)
+        args = self._build_args(
+            hand_tiles,
+            melds=melds,
+            called_tile=called_tile,
+            dora_tiles=dora_tiles,
+        )
         stdout = self._run(args)
         if stdout is None:
             return CallAnalysis(False, None, None, [], None, "", None, None)
@@ -150,35 +159,52 @@ class MahjongHelperEngine:
         stripped = ANSI_RE.sub("", stdout)
         lines = [line.rstrip() for line in stripped.splitlines()]
         candidates: list[DiscardCandidate] = []
+        current_shanten: Optional[int] = None
         for line in lines:
+            header_shanten = self._header_shanten(line)
+            if header_shanten is not None:
+                current_shanten = header_shanten
+                continue
             candidate = self._parse_candidate_line(line)
             if candidate is not None:
+                if candidate.shanten is None:
+                    candidate.shanten = current_shanten
                 candidates.append(candidate)
 
         best_tile = self._select_best_tile(candidates)
+        best_shanten = self._best_shanten_from_candidates(candidates, lines)
         analysis_text = self._format_analysis_text(lines, candidates)
-        return DiscardAnalysis(best_tile, candidates, analysis_text, stdout)
+        return DiscardAnalysis(best_tile, candidates, analysis_text, stdout, best_shanten)
 
     def parse_call_output(self, stdout: str) -> CallAnalysis:
         stripped = ANSI_RE.sub("", stdout)
         lines = [line.rstrip() for line in stripped.splitlines()]
         candidates: list[DiscardCandidate] = []
+        current_shanten: Optional[int] = None
+        base_shanten: Optional[int] = None
         for line in lines:
+            header_shanten = self._header_shanten(line)
+            if header_shanten is not None:
+                current_shanten = header_shanten
+                if "当前" in line:
+                    base_shanten = header_shanten
+                continue
             candidate = self._parse_candidate_line(line)
             if candidate is not None:
+                if candidate.shanten is None:
+                    candidate.shanten = current_shanten
                 candidates.append(candidate)
 
-        base_shanten = self._extract_base_shanten(lines)
         call_candidates = [c for c in candidates if c.call_type]
-        best_candidate = self._select_best_candidate(call_candidates)
+        best_candidate = call_candidates[0] if call_candidates else None
         best_tile = best_candidate.tile if best_candidate else None
         best_call_type = best_candidate.call_type if best_candidate else None
         best_shanten = best_candidate.shanten if best_candidate else None
 
         should_call = False
         if base_shanten is not None and best_shanten is not None:
-            should_call = best_shanten < base_shanten
-        elif best_candidate and "考虑型听" in stripped:
+            should_call = best_shanten <= base_shanten
+        elif best_candidate:
             should_call = True
 
         analysis_text = self._format_analysis_text(lines, candidates)
@@ -217,6 +243,7 @@ class MahjongHelperEngine:
         hand_tiles: Iterable[str],
         melds: Optional[Iterable[str]] = None,
         called_tile: Optional[str] = None,
+        dora_tiles: Optional[Iterable[str]] = None,
     ) -> list[str]:
         grouped = {"m": [], "p": [], "s": [], "z": []}
         for tile in hand_tiles:
@@ -229,6 +256,9 @@ class MahjongHelperEngine:
             grouped[suit].append(int(helper_tile[0]))
 
         args: list[str] = []
+        dora_arg = self._build_dora_arg(dora_tiles)
+        if dora_arg:
+            args.append(dora_arg)
         for suit in ("m", "p", "s", "z"):
             digits = grouped[suit]
             if not digits:
@@ -248,6 +278,30 @@ class MahjongHelperEngine:
 
         return args
 
+    def _build_dora_arg(self, dora_tiles: Optional[Iterable[str]]) -> Optional[str]:
+        if not dora_tiles:
+            return None
+        grouped = {"m": [], "p": [], "s": [], "z": []}
+        for tile in dora_tiles:
+            helper_tile = self.mjai_tile_to_helper(tile)
+            if helper_tile is None:
+                continue
+            suit = helper_tile[1]
+            if suit not in grouped:
+                continue
+            grouped[suit].append(int(helper_tile[0]))
+
+        parts = []
+        for suit in ("m", "p", "s", "z"):
+            digits = grouped[suit]
+            if not digits:
+                continue
+            digits.sort(key=lambda d: 5 if d == 0 else d)
+            parts.append("".join(str(d) for d in digits) + suit)
+        if not parts:
+            return None
+        return "-d=" + "".join(parts)
+
     def _parse_candidate_line(self, line: str) -> Optional[DiscardCandidate]:
         line = line.strip()
         if not line:
@@ -255,10 +309,11 @@ class MahjongHelperEngine:
 
         rank = None
         score = None
-        m = re.match(r"^\s*(\d+)\s*\[(\d+(?:\.\d+)?)\]", line)
+        m = re.match(r"^\s*(\d+)(?:\s*\[(\d+(?:\.\d+)?)\])?", line)
         if m:
             rank = int(m.group(1))
-            score = float(m.group(2))
+            if m.group(2):
+                score = float(m.group(2))
 
         tile_token = None
         m = re.search(r"(?:切|ド)\s*([^\s=>,，]+)", line)
@@ -281,14 +336,15 @@ class MahjongHelperEngine:
             return None
 
         call_type = self._detect_call_type(line)
-        shanten = self._extract_shanten(line)
+        no_yaku = "无役" in line
         return DiscardCandidate(
             tile=tile,
             score=score,
             rank=rank,
             raw_line=line,
             call_type=call_type,
-            shanten=shanten,
+            shanten=None,
+            no_yaku=no_yaku,
         )
 
     def _parse_tile_token(self, token: str) -> Optional[str]:
@@ -346,18 +402,29 @@ class MahjongHelperEngine:
             return "daiminkan"
         return None
 
-    def _extract_shanten(self, line: str) -> Optional[int]:
+    def _header_shanten(self, line: str) -> Optional[int]:
+        stripped = line.strip()
+        if not stripped:
+            return None
+        if not (stripped.endswith("：") or stripped.endswith(":")):
+            return None
         for word, value in SHANTEN_WORDS.items():
-            if word in line:
+            if word in stripped:
                 return value
         return None
 
-    def _extract_base_shanten(self, lines: list[str]) -> Optional[int]:
+    def _best_shanten_from_candidates(
+        self,
+        candidates: list[DiscardCandidate],
+        lines: list[str],
+    ) -> Optional[int]:
+        shanten_values = [c.shanten for c in candidates if c.shanten is not None]
+        if shanten_values:
+            return min(shanten_values)
         for line in lines:
-            if "当前" in line or line.endswith("：") or line.endswith(":"):
-                shanten = self._extract_shanten(line)
-                if shanten is not None:
-                    return shanten
+            header = self._header_shanten(line)
+            if header is not None:
+                return header
         return None
 
     def _select_best_tile(self, candidates: list[DiscardCandidate]) -> Optional[str]:
@@ -368,12 +435,6 @@ class MahjongHelperEngine:
         self,
         candidates: list[DiscardCandidate],
     ) -> Optional[DiscardCandidate]:
-        scored = [c for c in candidates if c.score is not None]
-        if scored:
-            return max(scored, key=lambda c: c.score)
-        ranked = [c for c in candidates if c.rank is not None]
-        if ranked:
-            return max(ranked, key=lambda c: c.rank)
         if candidates:
             return candidates[0]
         return None

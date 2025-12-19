@@ -22,6 +22,7 @@ def test_parse_sample_output() -> None:
     engine = MahjongHelperEngine()
     analysis = engine.parse_discard_output(SAMPLE_OUTPUT)
     assert analysis.best_tile in ("5p", "8p")
+    assert analysis.best_shanten == 1
     assert len(analysis.candidates) > 0
 
 

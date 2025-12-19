@@ -14,8 +14,10 @@ Akagi's UI and MITM bridge intact.
 ## Notes
 
 - Melds are passed via `#` when known; concealed kans are uppercased.
+- Dora indicators are converted to actual dora tiles and passed via `-d=...`.
 - Call decisions are best-effort; the bot passes when output is uncertain.
 - Recommendations are mapped to Akagi's UI via `meta` fields.
+- Auto-riichi when tenpai and auto-nukidora in 3P when a north tile is held.
 
 ## Self-test
 
