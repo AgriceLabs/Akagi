@@ -44,7 +44,9 @@ NO_YAKU_PENALTY = 60.0
 YAKUHAI_ONLY_PENALTY = 25.0
 EARLY_CALL_TURN_LIMIT = 5
 RIICHI_DORA_THRESHOLD = 2
-LOW_VALUE_OPEN_YAKU = {"混全", "纯全", "混老头"}
+LOW_VALUE_OPEN_YAKU = {"断幺", "混全", "纯全", "混老头"}
+NO_YAKU_TENPAI_PENALTY = 200.0
+SHANTEN_PENALTY = 40.0
 
 
 @dataclass
@@ -193,13 +195,25 @@ class Bot(AkagiBot):
         )
         options = [
             option for option in options
-            if option.call_type != "chi"
-            or self._allow_chi_option(
-                option=option,
-                base_shanten=base_shanten,
-                hand_tiles=hand_tiles,
-                called_tile=called_tile,
-                dora_tiles=dora_tiles,
+            if (
+                option.call_type != "chi"
+                or self._allow_chi_option(
+                    option=option,
+                    base_shanten=base_shanten,
+                    hand_tiles=hand_tiles,
+                    called_tile=called_tile,
+                    dora_tiles=dora_tiles,
+                )
+            )
+            and (
+                option.call_type != "pon"
+                or self._allow_pon_option(
+                    option=option,
+                    base_shanten=base_shanten,
+                    hand_tiles=hand_tiles,
+                    called_tile=called_tile,
+                    dora_tiles=dora_tiles,
+                )
             )
         ]
         if not options:
@@ -393,14 +407,35 @@ class Bot(AkagiBot):
 
         candidates: dict[str, float] = {}
         yaku_by_tile: dict[str, int] = {}
+        tenpai_tiles: set[str] = set()
+        best_shanten = analysis.best_shanten
+        has_yaku_tenpai = False
+        if is_open and best_shanten == 0:
+            for cand in analysis.candidates:
+                if cand.shanten != 0:
+                    continue
+                category = self._yaku_category(cand)
+                if category >= 1:
+                    has_yaku_tenpai = True
+                    break
+
+        use_best_shanten = True
+        if is_open and best_shanten == 0 and not has_yaku_tenpai:
+            use_best_shanten = False
+
         filtered = analysis.candidates
-        if analysis.best_shanten is not None:
+        if best_shanten is not None and use_best_shanten:
             filtered_best = [
                 cand for cand in analysis.candidates
-                if cand.shanten == analysis.best_shanten
+                if cand.shanten == best_shanten
             ]
             if filtered_best:
                 filtered = filtered_best
+        elif best_shanten is not None:
+            filtered = [
+                cand for cand in analysis.candidates
+                if cand.shanten is None or cand.shanten <= best_shanten + 1
+            ]
 
         for cand in filtered:
             actual = _select_tile_from_hand(cand.tile, hand_tiles)
@@ -418,10 +453,16 @@ class Bot(AkagiBot):
                 prev = yaku_by_tile.get(actual, -1)
                 if category > prev:
                     yaku_by_tile[actual] = category
-                if category == 0:
+                if cand.shanten == 0:
+                    tenpai_tiles.add(actual)
+                if cand.shanten == 0 and category == 0:
+                    score -= NO_YAKU_TENPAI_PENALTY
+                elif category == 0:
                     score -= NO_YAKU_PENALTY
                 elif category == 1:
                     score -= YAKUHAI_ONLY_PENALTY
+                if not use_best_shanten and best_shanten is not None and cand.shanten is not None:
+                    score -= (cand.shanten - best_shanten) * SHANTEN_PENALTY
             if defense_ctx is not None:
                 score -= tile_danger(actual, defense_ctx) * defense_weight
             if actual not in candidates or score > candidates[actual]:
@@ -429,6 +470,15 @@ class Bot(AkagiBot):
 
         if not candidates:
             return {}, None
+
+        if is_open and best_shanten == 0 and not has_yaku_tenpai:
+            filtered_noyaku = {
+                tile: score
+                for tile, score in candidates.items()
+                if not (tile in tenpai_tiles and yaku_by_tile.get(tile, 0) == 0)
+            }
+            if filtered_noyaku:
+                candidates = filtered_noyaku
 
         if yakuhai_pairs and not threat_levels:
             non_yakuhai = {
@@ -824,12 +874,12 @@ class Bot(AkagiBot):
             return 1
         return 2
 
-    def _chi_low_value_yaku(self, option: CallOption) -> bool:
+    def _option_yaku_summary(self, option: CallOption) -> tuple[bool, bool]:
         candidates = option.analysis.candidates
         if not candidates:
-            return False
+            return False, False
         best_shanten = option.analysis.best_shanten
-        seen_low = False
+        seen = False
         for cand in candidates:
             if best_shanten is not None and cand.shanten != best_shanten:
                 continue
@@ -839,10 +889,52 @@ class Bot(AkagiBot):
             }
             if not tags:
                 continue
+            seen = True
             if tags - LOW_VALUE_OPEN_YAKU:
-                return False
-            seen_low = True
-        return seen_low
+                return False, True
+        if seen:
+            return True, True
+        return False, False
+
+    def _chi_low_value_yaku(self, option: CallOption) -> bool:
+        low_value_only, has_any = self._option_yaku_summary(option)
+        return low_value_only and has_any
+
+    def _allow_pon_option(
+        self,
+        option: CallOption,
+        base_shanten: Optional[int],
+        hand_tiles: list[str],
+        called_tile: str,
+        dora_tiles: list[str],
+    ) -> bool:
+        if option.call_type != "pon":
+            return True
+        if self.is_yakuhai(called_tile):
+            return True
+        improvement = None
+        if option.shanten is not None and base_shanten is not None:
+            improvement = base_shanten - option.shanten
+        if improvement is None:
+            return False
+        already_open = self._open_melds_by_player.get(self.player_id, 0) > 0
+        dora_count = self._count_dora_tiles(hand_tiles + [called_tile], dora_tiles)
+        plan_ok = False
+        if dora_count >= 1:
+            plan_ok = True
+        if self._honitsu_potential(hand_tiles, called_tile):
+            plan_ok = True
+        if self._chinitsu_potential(hand_tiles, called_tile):
+            plan_ok = True
+        low_value_only, has_any_yaku = self._option_yaku_summary(option)
+
+        if not has_any_yaku:
+            return improvement >= 1 and plan_ok
+        if low_value_only:
+            return improvement >= 1 and dora_count >= 1
+        if improvement >= 1:
+            return True
+        return already_open and plan_ok
 
     def _allow_chi_option(
         self,
