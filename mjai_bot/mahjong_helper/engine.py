@@ -466,24 +466,20 @@ class MahjongHelperEngine:
         return None
 
     def _extract_yaku_tags(self, line: str) -> list[str]:
-        tags: list[str] = []
+        tags: set[str] = set()
         for group in BRACKET_RE.findall(line):
             group = group.strip()
             if not group:
                 continue
             if "无役" in group:
-                tags.append("无役")
+                tags.add("无役")
                 continue
             if "宝牌" in group:
-                tags.append("宝牌")
-            if any(ch.isdigit() for ch in group):
-                continue
-            tokens = group.replace("　", " ").split()
-            for token in tokens:
-                token = token.strip()
-                if token in YAKU_TOKENS:
-                    tags.append(token)
-        return tags
+                tags.add("宝牌")
+            for token in YAKU_TOKENS:
+                if token in group:
+                    tags.add(token)
+        return sorted(tags)
 
     def _best_shanten_from_candidates(
         self,

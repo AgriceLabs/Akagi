@@ -43,6 +43,8 @@ YAKUHAI_CALL_BONUS = 80.0
 NO_YAKU_PENALTY = 60.0
 YAKUHAI_ONLY_PENALTY = 25.0
 EARLY_CALL_TURN_LIMIT = 5
+RIICHI_DORA_THRESHOLD = 2
+LOW_VALUE_OPEN_YAKU = {"混全", "纯全", "混老头"}
 
 
 @dataclass
@@ -69,6 +71,8 @@ class Bot(AkagiBot):
         self._open_melds_by_player: dict[int, int] = {}
         self._last_self_draw: Optional[str] = None
         self._awaiting_discard = False
+        self._analysis_cache_key: Optional[tuple] = None
+        self._analysis_cache: Optional[DiscardAnalysis] = None
 
     def react(self, events: str) -> str:
         try:
@@ -129,11 +133,7 @@ class Bot(AkagiBot):
         hand_tiles = self._current_hand_tiles()
         melds = self._build_helper_melds()
         dora_tiles = _dora_tiles_from_indicators(self._dora_indicators)
-        analysis = self._engine.analyze_discard(
-            hand_tiles,
-            melds=melds,
-            dora_tiles=dora_tiles,
-        )
+        analysis = self._get_discard_analysis(hand_tiles, melds, dora_tiles)
         if analysis.raw_stdout:
             logger.debug(f"mahjong-helper stdout:\n{analysis.raw_stdout}")
 
@@ -191,6 +191,17 @@ class Bot(AkagiBot):
             melds=melds,
             dora_tiles=dora_tiles,
         )
+        options = [
+            option for option in options
+            if option.call_type != "chi"
+            or self._allow_chi_option(
+                option=option,
+                base_shanten=base_shanten,
+                hand_tiles=hand_tiles,
+                called_tile=called_tile,
+                dora_tiles=dora_tiles,
+            )
+        ]
         if not options:
             return self._action_with_meta(
                 {"type": "none"},
@@ -320,105 +331,56 @@ class Bot(AkagiBot):
         analysis: DiscardAnalysis,
         hand_tiles: list[str],
     ) -> Optional[str]:
+        scores, _ = self._evaluate_discard(analysis, hand_tiles)
+        if scores:
+            return max(scores.items(), key=lambda item: item[1])[0]
+
         discardable = self._discardable_tiles()
         if discardable:
-            hand_tiles = [tile for tile in hand_tiles if tile in discardable]
-
-        candidates: list[str] = []
-        is_open = self._open_melds_by_player.get(self.player_id, 0) > 0
-        yaku_by_tile: dict[str, int] = {}
-        for cand in analysis.candidates:
-            tile = _select_tile_from_hand(cand.tile, hand_tiles)
-            if not tile:
-                continue
-            if discardable and tile not in discardable:
-                continue
-            if is_open:
-                category = self._yaku_category(cand)
-                prev = yaku_by_tile.get(tile, -1)
-                if category > prev:
-                    yaku_by_tile[tile] = category
-            if tile not in candidates:
-                candidates.append(tile)
-
-        if not candidates:
-            candidates = hand_tiles
-
-        if not candidates:
-            if self._last_self_draw not in (None, "?"):
-                return self._last_self_draw
-            return None
-
-        threat_levels = self._threat_levels()
-        yakuhai_pairs = self._yakuhai_pair_tiles(hand_tiles)
-        if yakuhai_pairs and not threat_levels:
-            non_yakuhai = [
-                tile for tile in candidates
-                if _tile_kind(tile) not in yakuhai_pairs
-            ]
-            if non_yakuhai:
-                candidates = non_yakuhai
-        if is_open and yaku_by_tile:
-            if any(cat >= 2 for cat in yaku_by_tile.values()):
-                filtered = [tile for tile in candidates if yaku_by_tile.get(tile, 0) >= 2]
-            elif any(cat >= 1 for cat in yaku_by_tile.values()):
-                filtered = [tile for tile in candidates if yaku_by_tile.get(tile, 0) >= 1]
-            else:
-                filtered = []
-            if filtered:
-                candidates = filtered
-        if not threat_levels:
-            garbage, soft_garbage = self._discard_focus_kinds(hand_tiles)
-            filtered = self._filter_candidates_by_kinds(candidates, garbage)
-            if not filtered:
-                filtered = self._filter_candidates_by_kinds(candidates, soft_garbage)
-            if filtered:
-                candidates = filtered
-        if not threat_levels:
-            return candidates[0]
-
-        dora_tiles = set(_dora_tiles_from_indicators(self._dora_indicators))
-        ctx = DefenseContext(
-            threat_levels=threat_levels,
-            discards_by_player=self._discards_by_player,
-            tiles_seen=self.tiles_seen,
-            dora_tiles=dora_tiles,
-        )
-
-        danger_scores = {tile: tile_danger(tile, ctx) for tile in candidates}
-        safe_candidates = [tile for tile in candidates if danger_scores[tile] == 0.0]
-        if safe_candidates:
-            return safe_candidates[0]
-
-        top_n = min(5, len(candidates))
-        best_tile = candidates[0]
-        best_score = danger_scores[best_tile]
-        for tile in candidates[:top_n]:
-            score = danger_scores[tile]
-            if score < best_score:
-                best_score = score
-                best_tile = tile
-
-        logger.debug(
-            "Defense pick: %s (danger=%.2f) from %s",
-            best_tile,
-            best_score,
-            ", ".join(candidates[:top_n]),
-        )
-        return best_tile
+            return discardable[0]
+        if hand_tiles:
+            return hand_tiles[0]
+        if self._last_self_draw not in (None, "?"):
+            return self._last_self_draw
+        return None
 
     def _build_meta(
         self,
         analysis: DiscardAnalysis,
         hand_tiles: list[str],
     ) -> Optional[dict]:
+        candidates, analysis_text = self._evaluate_discard(analysis, hand_tiles)
+        if not candidates:
+            return None
+
+        mask_unicode = MASK_UNICODE_3P if self.is_3p else MASK_UNICODE_4P
+        mask_bits = 0
+        q_values = []
+        for idx, key in enumerate(mask_unicode):
+            if key in candidates:
+                mask_bits |= (1 << idx)
+                q_values.append(candidates[key])
+
+        meta = {
+            "q_values": q_values,
+            "mask_bits": mask_bits,
+        }
+        if analysis_text:
+            meta["analysis"] = analysis_text
+        return meta
+
+    def _evaluate_discard(
+        self,
+        analysis: DiscardAnalysis,
+        hand_tiles: list[str],
+    ) -> tuple[dict[str, float], Optional[str]]:
         discardable = set(self._discardable_tiles())
+        threat_levels = self._threat_levels()
+        yakuhai_pairs = self._yakuhai_pair_tiles(hand_tiles)
+        is_open = self._open_melds_by_player.get(self.player_id, 0) > 0
+
         defense_ctx = None
         defense_weight = 0.0
-        threat_levels = self._threat_levels()
-        is_open = self._open_melds_by_player.get(self.player_id, 0) > 0
-        yakuhai_pairs = self._yakuhai_pair_tiles(hand_tiles)
-        apply_yakuhai_bias = not threat_levels
         if threat_levels:
             max_threat = max(threat_levels.values())
             defense_weight = 20.0 * max_threat + 5.0 * (len(threat_levels) - 1)
@@ -428,7 +390,9 @@ class Bot(AkagiBot):
                 tiles_seen=self.tiles_seen,
                 dora_tiles=set(_dora_tiles_from_indicators(self._dora_indicators)),
             )
-        candidates = {}
+
+        candidates: dict[str, float] = {}
+        yaku_by_tile: dict[str, int] = {}
         filtered = analysis.candidates
         if analysis.best_shanten is not None:
             filtered_best = [
@@ -451,6 +415,9 @@ class Bot(AkagiBot):
                 score = 0.0
             if is_open:
                 category = self._yaku_category(cand)
+                prev = yaku_by_tile.get(actual, -1)
+                if category > prev:
+                    yaku_by_tile[actual] = category
                 if category == 0:
                     score -= NO_YAKU_PENALTY
                 elif category == 1:
@@ -460,7 +427,10 @@ class Bot(AkagiBot):
             if actual not in candidates or score > candidates[actual]:
                 candidates[actual] = score
 
-        if apply_yakuhai_bias and yakuhai_pairs:
+        if not candidates:
+            return {}, None
+
+        if yakuhai_pairs and not threat_levels:
             non_yakuhai = {
                 tile: score
                 for tile, score in candidates.items()
@@ -468,7 +438,27 @@ class Bot(AkagiBot):
             }
             if non_yakuhai:
                 candidates = non_yakuhai
-        if apply_yakuhai_bias:
+
+        if is_open and yaku_by_tile:
+            yaku_by_tile = {tile: yaku_by_tile.get(tile, 0) for tile in candidates}
+            max_cat = max(yaku_by_tile.values(), default=0)
+            filtered_yaku: dict[str, float] = {}
+            if max_cat >= 2:
+                filtered_yaku = {
+                    tile: score
+                    for tile, score in candidates.items()
+                    if yaku_by_tile.get(tile, 0) >= 2
+                }
+            elif max_cat >= 1:
+                filtered_yaku = {
+                    tile: score
+                    for tile, score in candidates.items()
+                    if yaku_by_tile.get(tile, 0) >= 1
+                }
+            if filtered_yaku:
+                candidates = filtered_yaku
+
+        if not threat_levels:
             garbage, soft_garbage = self._discard_focus_kinds(hand_tiles)
             filtered = self._filter_scored_by_kinds(candidates, garbage)
             if not filtered:
@@ -476,8 +466,13 @@ class Bot(AkagiBot):
             if filtered:
                 candidates = filtered
 
-        if not candidates:
-            return None
+        if defense_ctx is not None:
+            safe = {
+                tile for tile in candidates
+                if tile_danger(tile, defense_ctx) == 0.0
+            }
+            if safe:
+                candidates = {tile: candidates[tile] for tile in safe}
 
         analysis_text = None
         header = None
@@ -493,21 +488,29 @@ class Bot(AkagiBot):
                 parts.append("Top discards: " + top)
             analysis_text = " | ".join(parts) if parts else None
 
-        mask_unicode = MASK_UNICODE_3P if self.is_3p else MASK_UNICODE_4P
-        mask_bits = 0
-        q_values = []
-        for idx, key in enumerate(mask_unicode):
-            if key in candidates:
-                mask_bits |= (1 << idx)
-                q_values.append(candidates[key])
+        return candidates, analysis_text
 
-        meta = {
-            "q_values": q_values,
-            "mask_bits": mask_bits,
-        }
-        if analysis_text:
-            meta["analysis"] = analysis_text
-        return meta
+    def _get_discard_analysis(
+        self,
+        hand_tiles: list[str],
+        melds: list[str],
+        dora_tiles: list[str],
+    ) -> DiscardAnalysis:
+        key = (
+            tuple(sorted(hand_tiles)),
+            tuple(sorted(melds)),
+            tuple(sorted(dora_tiles)),
+        )
+        if self._analysis_cache_key == key and self._analysis_cache is not None:
+            return self._analysis_cache
+        analysis = self._engine.analyze_discard(
+            hand_tiles,
+            melds=melds,
+            dora_tiles=dora_tiles,
+        )
+        self._analysis_cache_key = key
+        self._analysis_cache = analysis
+        return analysis
 
     def _build_helper_melds(self) -> list[str]:
         melds: list[str] = []
@@ -618,6 +621,8 @@ class Bot(AkagiBot):
         return scores
 
     def _track_state(self, events: list[dict]) -> None:
+        self._analysis_cache_key = None
+        self._analysis_cache = None
         for event in events:
             if event["type"] == "start_game":
                 self.player_id = event.get("id", self.player_id)
@@ -720,7 +725,42 @@ class Bot(AkagiBot):
         return tiles
 
     def _should_riichi(self) -> bool:
-        return self.can_riichi and self.shanten == 0
+        if not self.can_riichi or self.shanten != 0:
+            return False
+        threat_levels = self._threat_levels()
+        if any(level >= 2.0 for level in threat_levels.values()):
+            return True
+        if any(
+            count >= 3
+            for player, count in self._open_melds_by_player.items()
+            if player != self.player_id
+        ):
+            return True
+
+        hand_tiles = self._current_hand_tiles()
+        melds = self._build_helper_melds()
+        dora_tiles = _dora_tiles_from_indicators(self._dora_indicators)
+        analysis = self._get_discard_analysis(hand_tiles, melds, dora_tiles)
+        riichi_tiles = set(self.discardable_tiles_riichi_declaration)
+        best_category = -1
+        for cand in analysis.candidates:
+            if cand.shanten != 0:
+                continue
+            actual = _select_tile_from_hand(cand.tile, hand_tiles)
+            if not actual:
+                continue
+            if riichi_tiles and actual not in riichi_tiles:
+                continue
+            category = self._riichi_yaku_category(cand)
+            if category > best_category:
+                best_category = category
+            if category >= 2:
+                return True
+
+        dora_count = self._count_dora_tiles(hand_tiles, dora_tiles)
+        if dora_count >= RIICHI_DORA_THRESHOLD:
+            return True
+        return False
 
     def _should_nukidora(self) -> bool:
         if not self.is_3p:
@@ -772,6 +812,130 @@ class Bot(AkagiBot):
         if set(tags) == {"役牌"}:
             return 1
         return 2
+
+    def _riichi_yaku_category(self, cand: DiscardCandidate) -> int:
+        tags = [
+            tag for tag in cand.yaku_tags
+            if tag not in ("宝牌", "无役", "立直", "自摸")
+        ]
+        if "无役" in cand.yaku_tags or not tags:
+            return 0
+        if set(tags) == {"役牌"}:
+            return 1
+        return 2
+
+    def _chi_low_value_yaku(self, option: CallOption) -> bool:
+        candidates = option.analysis.candidates
+        if not candidates:
+            return False
+        best_shanten = option.analysis.best_shanten
+        seen_low = False
+        for cand in candidates:
+            if best_shanten is not None and cand.shanten != best_shanten:
+                continue
+            tags = {
+                tag for tag in cand.yaku_tags
+                if tag not in ("宝牌", "无役", "立直", "自摸", "w立")
+            }
+            if not tags:
+                continue
+            if tags - LOW_VALUE_OPEN_YAKU:
+                return False
+            seen_low = True
+        return seen_low
+
+    def _allow_chi_option(
+        self,
+        option: CallOption,
+        base_shanten: Optional[int],
+        hand_tiles: list[str],
+        called_tile: str,
+        dora_tiles: list[str],
+    ) -> bool:
+        if option.call_type != "chi":
+            return True
+        improvement = None
+        if option.shanten is not None and base_shanten is not None:
+            improvement = base_shanten - option.shanten
+        already_open = self._open_melds_by_player.get(self.player_id, 0) > 0
+        dora_count = self._count_dora_tiles(hand_tiles + [called_tile], dora_tiles)
+        plan_ok = False
+        if dora_count >= 2:
+            plan_ok = True
+        if self._honitsu_potential(hand_tiles, called_tile):
+            plan_ok = True
+        if self._chinitsu_potential(hand_tiles, called_tile):
+            plan_ok = True
+        if self._tanyao_potential(hand_tiles, called_tile):
+            plan_ok = True
+        low_value = self._chi_low_value_yaku(option)
+        if low_value and not plan_ok and not already_open:
+            return False
+        if already_open:
+            return improvement is None or improvement >= 0
+        early_turn = self._turn_count() <= EARLY_CALL_TURN_LIMIT
+        if not early_turn:
+            return improvement is not None and improvement >= 0
+        if improvement is not None and improvement > 0:
+            if low_value and not plan_ok:
+                return False
+            return True
+        if plan_ok and not low_value:
+            return True
+        return False
+
+    def _count_dora_tiles(self, tiles: list[str], dora_tiles: list[str]) -> int:
+        dora_kinds = {_tile_kind(tile) for tile in dora_tiles if tile}
+        count = 0
+        for tile in tiles:
+            kind = _tile_kind(tile)
+            if kind in dora_kinds:
+                count += 1
+            if tile.endswith("r"):
+                count += 1
+        return count
+
+    def _honitsu_potential(self, hand_tiles: list[str], called_tile: str) -> bool:
+        suit_counts, honor_count = self._suit_counts(hand_tiles + [called_tile])
+        max_suit = max(suit_counts.values())
+        return max_suit >= 9 and honor_count <= 4
+
+    def _chinitsu_potential(self, hand_tiles: list[str], called_tile: str) -> bool:
+        suit_counts, honor_count = self._suit_counts(hand_tiles + [called_tile])
+        max_suit = max(suit_counts.values())
+        return honor_count == 0 and max_suit >= 10
+
+    def _tanyao_potential(self, hand_tiles: list[str], called_tile: str) -> bool:
+        if not self._is_simple_tile(called_tile):
+            return False
+        tiles = hand_tiles + [called_tile]
+        terminals_or_honors = sum(
+            1 for tile in tiles if self._is_terminal_or_honor(tile)
+        )
+        return terminals_or_honors <= 2
+
+    def _suit_counts(self, tiles: list[str]) -> tuple[dict[str, int], int]:
+        suit_counts = {"m": 0, "p": 0, "s": 0}
+        honor_count = 0
+        for tile in tiles:
+            kind = _tile_kind(tile)
+            if kind in ("E", "S", "W", "N", "P", "F", "C"):
+                honor_count += 1
+                continue
+            if len(kind) >= 2 and kind[1] in suit_counts:
+                suit_counts[kind[1]] += 1
+        return suit_counts, honor_count
+
+    def _is_terminal_or_honor(self, tile: str) -> bool:
+        kind = _tile_kind(tile)
+        if kind in ("E", "S", "W", "N", "P", "F", "C"):
+            return True
+        num = _tile_number(kind)
+        return num in (1, 9)
+
+    def _is_simple_tile(self, tile: str) -> bool:
+        num = _tile_number(tile)
+        return num is not None and 2 <= num <= 8
 
     def _discard_focus_kinds(self, hand_tiles: list[str]) -> tuple[set[str], set[str]]:
         yakuhai = self._yakuhai_tiles()
