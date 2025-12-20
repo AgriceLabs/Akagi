@@ -47,6 +47,7 @@ RIICHI_DORA_THRESHOLD = 2
 LOW_VALUE_OPEN_YAKU = {"断幺", "混全", "纯全", "混老头"}
 NO_YAKU_TENPAI_PENALTY = 200.0
 SHANTEN_PENALTY = 40.0
+CLOSED_ONLY_YAKU = {"立直", "自摸", "平和", "一杯口", "两杯口", "七对", "w立"}
 
 
 @dataclass
@@ -450,7 +451,7 @@ class Bot(AkagiBot):
             if score is None:
                 score = 0.0
             if is_open:
-                category = self._yaku_category(cand)
+                category = self._yaku_category(cand, is_open=True)
                 prev = yaku_by_tile.get(actual, -1)
                 if category > prev:
                     yaku_by_tile[actual] = category
@@ -893,8 +894,13 @@ class Bot(AkagiBot):
     def _turn_count(self) -> int:
         return len(self._discards_by_player.get(self.player_id, []))
 
-    def _yaku_category(self, cand: DiscardCandidate) -> int:
-        tags = [tag for tag in cand.yaku_tags if tag not in ("宝牌", "无役")]
+    def _yaku_category(self, cand: DiscardCandidate, is_open: bool = False) -> int:
+        tags = [
+            tag for tag in cand.yaku_tags
+            if tag not in ("宝牌", "无役")
+        ]
+        if is_open:
+            tags = [tag for tag in tags if tag not in CLOSED_ONLY_YAKU]
         if "无役" in cand.yaku_tags or not tags:
             return 0
         if set(tags) == {"役牌"}:
@@ -925,6 +931,7 @@ class Bot(AkagiBot):
                 tag for tag in cand.yaku_tags
                 if tag not in ("宝牌", "无役", "立直", "自摸", "w立")
             }
+            tags = {tag for tag in tags if tag not in CLOSED_ONLY_YAKU}
             if not tags:
                 continue
             seen = True
@@ -996,9 +1003,11 @@ class Bot(AkagiBot):
             plan_ok = True
         if self._chinitsu_potential(hand_tiles, called_tile):
             plan_ok = True
-        if self._tanyao_potential(hand_tiles, called_tile):
+        if self._tanyao_potential(hand_tiles, called_tile, option.consumed):
             plan_ok = True
-        low_value = self._chi_low_value_yaku(option)
+        low_value, has_any_yaku = self._option_yaku_summary(option)
+        if not has_any_yaku and not plan_ok and not already_open:
+            return False
         if low_value and not plan_ok and not already_open:
             return False
         if already_open:
@@ -1007,7 +1016,7 @@ class Bot(AkagiBot):
         if not early_turn:
             return improvement is not None and improvement >= 0
         if improvement is not None and improvement > 0:
-            if low_value and not plan_ok:
+            if (low_value or not has_any_yaku) and not plan_ok:
                 return False
             return True
         if plan_ok and not low_value:
@@ -1035,10 +1044,18 @@ class Bot(AkagiBot):
         max_suit = max(suit_counts.values())
         return honor_count == 0 and max_suit >= 10
 
-    def _tanyao_potential(self, hand_tiles: list[str], called_tile: str) -> bool:
+    def _tanyao_potential(
+        self,
+        hand_tiles: list[str],
+        called_tile: str,
+        consumed: Optional[list[str]] = None,
+    ) -> bool:
         if not self._is_simple_tile(called_tile):
             return False
-        tiles = hand_tiles + [called_tile]
+        meld_tiles = (consumed or []) + [called_tile]
+        if any(self._is_terminal_or_honor(tile) for tile in meld_tiles):
+            return False
+        tiles = hand_tiles + meld_tiles
         terminals_or_honors = sum(
             1 for tile in tiles if self._is_terminal_or_honor(tile)
         )

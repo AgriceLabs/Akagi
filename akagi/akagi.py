@@ -782,7 +782,22 @@ class BestAction(Horizontal):
                 best_action_rule.update(VERTICAL_RULE)
                 best_action_consume.update_consume(mjai_msg["consumed"][1:])
             case "reach" | "hora" | "ryukyoku":
-                best_action_tile.update(TILE_2_UNICODE_ART_RICH["?"])
+                if (
+                    mjai_msg["type"] == "reach"
+                    and "meta" in mjai_msg
+                    and "q_values" in mjai_msg["meta"]
+                ):
+                    recommends = meta_to_recommend(mjai_msg["meta"], mjai_bot.is_3p)
+                    tile = next(
+                        (rec[0] for rec in recommends if rec[0] not in action_name),
+                        None,
+                    )
+                    if tile and tile in TILE_2_UNICODE_ART_RICH:
+                        best_action_tile.update(TILE_2_UNICODE_ART_RICH[tile])
+                    else:
+                        best_action_tile.update(TILE_2_UNICODE_ART_RICH["?"])
+                else:
+                    best_action_tile.update(TILE_2_UNICODE_ART_RICH["?"])
                 best_action_rule.update(EMPTY_VERTICAL_RULE)
                 best_action_consume.clear_consume()
             case _:
