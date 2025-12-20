@@ -103,12 +103,13 @@ class Bot(AkagiBot):
                     self._single_action_meta("nukidora"),
                 )
             if self._should_riichi():
+                riichi_meta = self._build_riichi_meta()
                 return self._action_with_meta(
                     {
                         "type": "reach",
                         "actor": self.player_id,
                     },
-                    self._single_action_meta("reach"),
+                    riichi_meta or self._single_action_meta("reach"),
                 )
             if self.can_ryukyoku:
                 return self._action_with_meta(
@@ -539,6 +540,43 @@ class Bot(AkagiBot):
             analysis_text = " | ".join(parts) if parts else None
 
         return candidates, analysis_text
+
+    def _build_riichi_meta(self) -> Optional[dict]:
+        hand_tiles = self._current_hand_tiles()
+        melds = self._build_helper_melds()
+        dora_tiles = _dora_tiles_from_indicators(self._dora_indicators)
+        analysis = self._get_discard_analysis(hand_tiles, melds, dora_tiles)
+        candidates, _ = self._evaluate_discard(analysis, hand_tiles)
+        if not candidates:
+            return self._single_action_meta("reach")
+
+        riichi_tiles = set(self.discardable_tiles_riichi_declaration)
+        if riichi_tiles:
+            candidates = {
+                tile: score for tile, score in candidates.items()
+                if tile in riichi_tiles
+            }
+        if not candidates:
+            return self._single_action_meta("reach")
+
+        header = None
+        if analysis.analysis_text:
+            header = analysis.analysis_text.split("|", 1)[0].strip()
+        ranked = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
+        analysis_text = None
+        if ranked:
+            top = ", ".join(f"{tile} ({score:.2f})" for tile, score in ranked[:3])
+            parts = []
+            if header:
+                parts.append(header)
+            if top:
+                parts.append("Riichi discards: " + top)
+            analysis_text = " | ".join(parts) if parts else None
+
+        meta = self._action_meta(candidates)
+        if analysis_text:
+            meta["analysis"] = analysis_text
+        return meta
 
     def _get_discard_analysis(
         self,
