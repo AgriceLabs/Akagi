@@ -195,34 +195,51 @@ class Bot(AkagiBot):
         if best_option.call_type == "daiminkan" and improvement < 1:
             should_call = False
         if not should_call:
-            return self._action({"type": "none"})
+            none_score = (max(action_scores.values()) if action_scores else 0.0) + 1.0
+            action_scores["none"] = none_score
+            return self._action_with_meta(
+                {"type": "none"},
+                self._action_meta(action_scores),
+            )
 
         if best_option.call_type == "chi" and self.can_chi:
-            return self._action({
-                "type": "chi",
-                "actor": self.player_id,
-                "target": self.target_actor,
-                "pai": called_tile,
-                "consumed": best_option.consumed,
-            })
+            return self._action_with_meta(
+                {
+                    "type": "chi",
+                    "actor": self.player_id,
+                    "target": self.target_actor,
+                    "pai": called_tile,
+                    "consumed": best_option.consumed,
+                },
+                self._action_meta(action_scores),
+            )
         if best_option.call_type == "pon" and self.can_pon:
-            return self._action({
-                "type": "pon",
-                "actor": self.player_id,
-                "target": self.target_actor,
-                "pai": called_tile,
-                "consumed": best_option.consumed,
-            })
+            return self._action_with_meta(
+                {
+                    "type": "pon",
+                    "actor": self.player_id,
+                    "target": self.target_actor,
+                    "pai": called_tile,
+                    "consumed": best_option.consumed,
+                },
+                self._action_meta(action_scores),
+            )
         if best_option.call_type == "daiminkan" and self.can_daiminkan:
-            return self._action({
-                "type": "daiminkan",
-                "actor": self.player_id,
-                "target": self.target_actor,
-                "pai": called_tile,
-                "consumed": best_option.consumed,
-            })
+            return self._action_with_meta(
+                {
+                    "type": "daiminkan",
+                    "actor": self.player_id,
+                    "target": self.target_actor,
+                    "pai": called_tile,
+                    "consumed": best_option.consumed,
+                },
+                self._action_meta(action_scores),
+            )
 
-        return self._action({"type": "none"})
+        return self._action_with_meta(
+            {"type": "none"},
+            self._action_meta({}),
+        )
 
     def _fallback_discard_action(self) -> str:
         hand_tiles = self._current_hand_tiles()
@@ -333,7 +350,16 @@ class Bot(AkagiBot):
                 dora_tiles=set(_dora_tiles_from_indicators(self._dora_indicators)),
             )
         candidates = {}
-        for cand in analysis.candidates:
+        filtered = analysis.candidates
+        if analysis.best_shanten is not None:
+            filtered_best = [
+                cand for cand in analysis.candidates
+                if cand.shanten == analysis.best_shanten
+            ]
+            if filtered_best:
+                filtered = filtered_best
+
+        for cand in filtered:
             actual = _select_tile_from_hand(cand.tile, hand_tiles)
             if not actual:
                 continue
@@ -437,6 +463,41 @@ class Bot(AkagiBot):
         shanten = option.shanten if option.shanten is not None else base_shanten + 2
         prefer = 1 if preferred_call_type and option.call_type == preferred_call_type else 0
         return (shanten, -prefer, -option.rank, -option.score)
+
+    def _call_action_scores(
+        self,
+        options: list[CallOption],
+        base_shanten: int,
+        called_tile: str,
+    ) -> dict[str, float]:
+        scores: dict[str, float] = {}
+        for option in options:
+            action_key = None
+            if option.call_type == "pon" and self.can_pon:
+                action_key = "pon"
+            elif option.call_type == "daiminkan" and self.can_kan:
+                action_key = "kan_select"
+            elif option.call_type == "chi" and self.can_chi:
+                action_key = _chi_action_key(called_tile, option.consumed)
+                if action_key == "chi_low" and not self.can_chi_low:
+                    action_key = None
+                elif action_key == "chi_mid" and not self.can_chi_mid:
+                    action_key = None
+                elif action_key == "chi_high" and not self.can_chi_high:
+                    action_key = None
+            if not action_key:
+                continue
+            if option.score is not None:
+                score = option.score
+            elif option.rank is not None:
+                score = option.rank
+            else:
+                score = 0.0
+            if option.shanten is not None:
+                score += (base_shanten - option.shanten) * 100.0
+            if action_key not in scores or score > scores[action_key]:
+                scores[action_key] = score
+        return scores
 
     def _track_state(self, events: list[dict]) -> None:
         for event in events:
@@ -554,6 +615,27 @@ class Bot(AkagiBot):
 
     def _action(self, data: dict) -> str:
         return json.dumps(data, separators=(",", ":"))
+
+    def _action_with_meta(self, data: dict, meta: Optional[dict]) -> str:
+        if meta is not None:
+            data["meta"] = meta
+        return json.dumps(data, separators=(",", ":"))
+
+    def _single_action_meta(self, action_key: str) -> dict:
+        return self._action_meta({action_key: 1.0})
+
+    def _action_meta(self, scores: dict[str, float]) -> dict:
+        mask_unicode = MASK_UNICODE_3P if self.is_3p else MASK_UNICODE_4P
+        mask_bits = 0
+        q_values = []
+        for idx, key in enumerate(mask_unicode):
+            if key in scores:
+                mask_bits |= (1 << idx)
+                q_values.append(scores[key])
+        return {
+            "q_values": q_values,
+            "mask_bits": mask_bits,
+        }
 
 
 def _timeout_ms(default: int = 1500) -> int:
@@ -675,3 +757,34 @@ def _call_type_has_yaku(candidates: list) -> dict[str, bool]:
         if not cand.no_yaku:
             has_yaku[cand.call_type] = True
     return has_yaku
+
+
+def _tile_number(tile: str) -> Optional[int]:
+    if len(tile) >= 2 and tile[1] in ("m", "p", "s"):
+        num = tile[0]
+        if num == "0":
+            num = "5"
+        if num.isdigit():
+            return int(num)
+    return None
+
+
+def _chi_action_key(called_tile: str, consumed: list[str]) -> Optional[str]:
+    if not called_tile or len(called_tile) < 2:
+        return None
+    if called_tile[1] not in ("m", "p", "s"):
+        return None
+    base = _tile_number(called_tile)
+    if base is None:
+        return None
+    nums = [_tile_number(tile) for tile in consumed]
+    if any(num is None for num in nums):
+        return None
+    nums_sorted = sorted(nums)
+    if nums_sorted == [base + 1, base + 2]:
+        return "chi_low"
+    if nums_sorted == [base - 1, base + 1]:
+        return "chi_mid"
+    if nums_sorted == [base - 2, base - 1]:
+        return "chi_high"
+    return None
