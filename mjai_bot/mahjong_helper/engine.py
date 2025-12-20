@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from mjai_bot.logger import logger
@@ -59,6 +59,51 @@ SHANTEN_WORDS = {
     "八向听": 8,
 }
 
+YAKU_TOKENS = {
+    "立直",
+    "自摸",
+    "七对",
+    "平和",
+    "两杯口",
+    "一杯口",
+    "三色",
+    "一通",
+    "对对",
+    "三暗刻",
+    "三色同刻",
+    "三杠子",
+    "断幺",
+    "役牌",
+    "混全",
+    "纯全",
+    "混老头",
+    "小三元",
+    "混一色",
+    "清一色",
+    "四暗刻",
+    "四暗刻单骑",
+    "大三元",
+    "小四喜",
+    "大四喜",
+    "字一色",
+    "清老头",
+    "绿一色",
+    "九莲",
+    "纯正九莲",
+    "四杠子",
+    "五门齐",
+    "三连刻",
+    "一色三顺",
+    "十二落抬",
+    "大数邻",
+    "大车轮",
+    "大竹林",
+    "大七星",
+    "w立",
+}
+
+BRACKET_RE = re.compile(r"\[([^\]]+)\]")
+
 
 @dataclass
 class DiscardCandidate:
@@ -69,6 +114,7 @@ class DiscardCandidate:
     call_type: Optional[str] = None
     shanten: Optional[int] = None
     no_yaku: bool = False
+    yaku_tags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -173,7 +219,11 @@ class MahjongHelperEngine:
 
         best_tile = self._select_best_tile(candidates)
         best_shanten = self._best_shanten_from_candidates(candidates, lines)
-        analysis_text = self._format_analysis_text(lines, candidates)
+        analysis_text = self._format_analysis_text(
+            lines,
+            candidates,
+            best_shanten=best_shanten,
+        )
         return DiscardAnalysis(best_tile, candidates, analysis_text, stdout, best_shanten)
 
     def parse_call_output(self, stdout: str) -> CallAnalysis:
@@ -336,7 +386,8 @@ class MahjongHelperEngine:
             return None
 
         call_type = self._detect_call_type(line)
-        no_yaku = "无役" in line
+        yaku_tags = self._extract_yaku_tags(line)
+        no_yaku = "无役" in line or "无役" in yaku_tags
         return DiscardCandidate(
             tile=tile,
             score=score,
@@ -345,6 +396,7 @@ class MahjongHelperEngine:
             call_type=call_type,
             shanten=None,
             no_yaku=no_yaku,
+            yaku_tags=yaku_tags,
         )
 
     def _parse_tile_token(self, token: str) -> Optional[str]:
@@ -413,6 +465,26 @@ class MahjongHelperEngine:
                 return value
         return None
 
+    def _extract_yaku_tags(self, line: str) -> list[str]:
+        tags: list[str] = []
+        for group in BRACKET_RE.findall(line):
+            group = group.strip()
+            if not group:
+                continue
+            if "无役" in group:
+                tags.append("无役")
+                continue
+            if "宝牌" in group:
+                tags.append("宝牌")
+            if any(ch.isdigit() for ch in group):
+                continue
+            tokens = group.replace("　", " ").split()
+            for token in tokens:
+                token = token.strip()
+                if token in YAKU_TOKENS:
+                    tags.append(token)
+        return tags
+
     def _best_shanten_from_candidates(
         self,
         candidates: list[DiscardCandidate],
@@ -444,6 +516,7 @@ class MahjongHelperEngine:
         lines: list[str],
         candidates: list[DiscardCandidate],
         max_count: int = 3,
+        best_shanten: Optional[int] = None,
     ) -> Optional[str]:
         header = None
         for line in lines:
@@ -456,6 +529,10 @@ class MahjongHelperEngine:
             return header
 
         ranked = candidates[:]
+        if best_shanten is not None:
+            filtered = [c for c in ranked if c.shanten == best_shanten]
+            if filtered:
+                ranked = filtered
         scored = [c for c in ranked if c.score is not None]
         if scored:
             ranked = sorted(scored, key=lambda c: c.score, reverse=True)

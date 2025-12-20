@@ -8,7 +8,7 @@ from typing import Optional
 from mjai_bot.bot import AkagiBot
 from mjai_bot.logger import logger
 
-from .engine import MahjongHelperEngine, DiscardAnalysis
+from .engine import MahjongHelperEngine, DiscardAnalysis, CallAnalysis, DiscardCandidate
 from .defense import DefenseContext, tile_danger
 
 MASK_UNICODE_4P = [
@@ -38,6 +38,11 @@ HONOR_DORA_NEXT = {
     "F": "C",
     "C": "P",
 }
+
+YAKUHAI_CALL_BONUS = 80.0
+NO_YAKU_PENALTY = 60.0
+YAKUHAI_ONLY_PENALTY = 25.0
+EARLY_CALL_TURN_LIMIT = 5
 
 
 @dataclass
@@ -78,17 +83,32 @@ class Bot(AkagiBot):
     def think(self) -> str:
         try:
             if self.can_agari:
-                return self._action({"type": "hora"})
+                return self._action_with_meta(
+                    {"type": "hora"},
+                    self._single_action_meta("hora"),
+                )
             if self._should_nukidora():
-                return self._action({
-                    "type": "nukidora",
-                    "actor": self.player_id,
-                    "pai": "N",
-                })
+                return self._action_with_meta(
+                    {
+                        "type": "nukidora",
+                        "actor": self.player_id,
+                        "pai": "N",
+                    },
+                    self._single_action_meta("nukidora"),
+                )
             if self._should_riichi():
-                return self.action_riichi()
+                return self._action_with_meta(
+                    {
+                        "type": "reach",
+                        "actor": self.player_id,
+                    },
+                    self._single_action_meta("reach"),
+                )
             if self.can_ryukyoku:
-                return self._action({"type": "ryukyoku"})
+                return self._action_with_meta(
+                    {"type": "ryukyoku"},
+                    self._single_action_meta("ryukyoku"),
+                )
             if self.can_pass and (self.can_chi or self.can_pon or self.can_daiminkan):
                 return self._think_call()
             if self.can_discard:
@@ -100,7 +120,10 @@ class Bot(AkagiBot):
             if self.can_discard:
                 return self._fallback_discard_action()
 
-        return self._action({"type": "none"})
+        return self._action_with_meta(
+            {"type": "none"},
+            self._action_meta({}),
+        )
 
     def _think_discard(self) -> str:
         hand_tiles = self._current_hand_tiles()
@@ -139,7 +162,10 @@ class Bot(AkagiBot):
     def _think_call(self) -> str:
         called_tile = getattr(self, "last_kawa_tile", None)
         if not called_tile or called_tile == "?":
-            return self._action({"type": "none"})
+            return self._action_with_meta(
+                {"type": "none"},
+                self._action_meta({}),
+            )
 
         hand_tiles = self._current_hand_tiles(include_tsumo=False)
         melds = self._build_helper_melds()
@@ -153,6 +179,12 @@ class Bot(AkagiBot):
         if analysis.raw_stdout:
             logger.debug(f"mahjong-helper call stdout:\n{analysis.raw_stdout}")
 
+        base_shanten = self._resolve_call_base_shanten(
+            analysis=analysis,
+            hand_tiles=hand_tiles,
+            melds=melds,
+            dora_tiles=dora_tiles,
+        )
         options = self._build_call_options(
             called_tile=called_tile,
             hand_tiles=hand_tiles,
@@ -160,9 +192,11 @@ class Bot(AkagiBot):
             dora_tiles=dora_tiles,
         )
         if not options:
-            return self._action({"type": "none"})
+            return self._action_with_meta(
+                {"type": "none"},
+                self._action_meta({}),
+            )
 
-        base_shanten = self.shanten
         options.sort(
             key=lambda option: self._call_option_key(
                 option,
@@ -170,36 +204,47 @@ class Bot(AkagiBot):
                 preferred_call_type=analysis.call_type,
             )
         )
+        action_scores = self._call_action_scores(
+            options=options,
+            base_shanten=base_shanten,
+            called_tile=called_tile,
+        )
         threat_levels = self._threat_levels()
         has_riichi_threat = any(level >= 2.0 for level in threat_levels.values())
         call_type_has_yaku = _call_type_has_yaku(analysis.candidates)
 
         best_option = options[0]
-        improvement = 0
-        if best_option.shanten is not None:
+        improvement: Optional[int] = None
+        if best_option.shanten is not None and base_shanten is not None:
             improvement = base_shanten - best_option.shanten
         no_yaku = call_type_has_yaku.get(best_option.call_type) is False
         yakuhai_call = best_option.call_type in ("pon", "daiminkan") and self.is_yakuhai(called_tile)
+        early_turn = self._turn_count() <= EARLY_CALL_TURN_LIMIT
+        already_open = self._open_melds_by_player.get(self.player_id, 0) > 0
 
         should_call = False
-        if improvement > 0:
+        if improvement is None:
+            if yakuhai_call and early_turn:
+                should_call = True
+        elif improvement > 0:
             should_call = True
         elif improvement == 0:
             if yakuhai_call:
                 should_call = True
-            elif analysis.should_call and not no_yaku:
+            elif already_open and analysis.should_call and not no_yaku:
+                should_call = True
+        else:
+            if yakuhai_call and improvement >= -1 and (early_turn or already_open):
                 should_call = True
 
-        if has_riichi_threat and improvement <= 0:
+        if has_riichi_threat and (improvement is None or improvement <= 0):
             should_call = False
-        if best_option.call_type == "daiminkan" and improvement < 1:
+        if best_option.call_type == "daiminkan" and (improvement is None or improvement < 1):
             should_call = False
         if not should_call:
-            none_score = (max(action_scores.values()) if action_scores else 0.0) + 1.0
-            action_scores["none"] = none_score
             return self._action_with_meta(
                 {"type": "none"},
-                self._action_meta(action_scores),
+                self._single_action_meta("none"),
             )
 
         if best_option.call_type == "chi" and self.can_chi:
@@ -280,12 +325,19 @@ class Bot(AkagiBot):
             hand_tiles = [tile for tile in hand_tiles if tile in discardable]
 
         candidates: list[str] = []
+        is_open = self._open_melds_by_player.get(self.player_id, 0) > 0
+        yaku_by_tile: dict[str, int] = {}
         for cand in analysis.candidates:
             tile = _select_tile_from_hand(cand.tile, hand_tiles)
             if not tile:
                 continue
             if discardable and tile not in discardable:
                 continue
+            if is_open:
+                category = self._yaku_category(cand)
+                prev = yaku_by_tile.get(tile, -1)
+                if category > prev:
+                    yaku_by_tile[tile] = category
             if tile not in candidates:
                 candidates.append(tile)
 
@@ -298,6 +350,30 @@ class Bot(AkagiBot):
             return None
 
         threat_levels = self._threat_levels()
+        yakuhai_pairs = self._yakuhai_pair_tiles(hand_tiles)
+        if yakuhai_pairs and not threat_levels:
+            non_yakuhai = [
+                tile for tile in candidates
+                if _tile_kind(tile) not in yakuhai_pairs
+            ]
+            if non_yakuhai:
+                candidates = non_yakuhai
+        if is_open and yaku_by_tile:
+            if any(cat >= 2 for cat in yaku_by_tile.values()):
+                filtered = [tile for tile in candidates if yaku_by_tile.get(tile, 0) >= 2]
+            elif any(cat >= 1 for cat in yaku_by_tile.values()):
+                filtered = [tile for tile in candidates if yaku_by_tile.get(tile, 0) >= 1]
+            else:
+                filtered = []
+            if filtered:
+                candidates = filtered
+        if not threat_levels:
+            garbage, soft_garbage = self._discard_focus_kinds(hand_tiles)
+            filtered = self._filter_candidates_by_kinds(candidates, garbage)
+            if not filtered:
+                filtered = self._filter_candidates_by_kinds(candidates, soft_garbage)
+            if filtered:
+                candidates = filtered
         if not threat_levels:
             return candidates[0]
 
@@ -340,6 +416,9 @@ class Bot(AkagiBot):
         defense_ctx = None
         defense_weight = 0.0
         threat_levels = self._threat_levels()
+        is_open = self._open_melds_by_player.get(self.player_id, 0) > 0
+        yakuhai_pairs = self._yakuhai_pair_tiles(hand_tiles)
+        apply_yakuhai_bias = not threat_levels
         if threat_levels:
             max_threat = max(threat_levels.values())
             defense_weight = 20.0 * max_threat + 5.0 * (len(threat_levels) - 1)
@@ -370,13 +449,49 @@ class Bot(AkagiBot):
                 score = float(cand.rank)
             if score is None:
                 score = 0.0
+            if is_open:
+                category = self._yaku_category(cand)
+                if category == 0:
+                    score -= NO_YAKU_PENALTY
+                elif category == 1:
+                    score -= YAKUHAI_ONLY_PENALTY
             if defense_ctx is not None:
                 score -= tile_danger(actual, defense_ctx) * defense_weight
             if actual not in candidates or score > candidates[actual]:
                 candidates[actual] = score
 
+        if apply_yakuhai_bias and yakuhai_pairs:
+            non_yakuhai = {
+                tile: score
+                for tile, score in candidates.items()
+                if _tile_kind(tile) not in yakuhai_pairs
+            }
+            if non_yakuhai:
+                candidates = non_yakuhai
+        if apply_yakuhai_bias:
+            garbage, soft_garbage = self._discard_focus_kinds(hand_tiles)
+            filtered = self._filter_scored_by_kinds(candidates, garbage)
+            if not filtered:
+                filtered = self._filter_scored_by_kinds(candidates, soft_garbage)
+            if filtered:
+                candidates = filtered
+
         if not candidates:
             return None
+
+        analysis_text = None
+        header = None
+        if analysis.analysis_text:
+            header = analysis.analysis_text.split("|", 1)[0].strip()
+        ranked = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
+        if ranked:
+            top = ", ".join(f"{tile} ({score:.2f})" for tile, score in ranked[:3])
+            parts = []
+            if header:
+                parts.append(header)
+            if top:
+                parts.append("Top discards: " + top)
+            analysis_text = " | ".join(parts) if parts else None
 
         mask_unicode = MASK_UNICODE_3P if self.is_3p else MASK_UNICODE_4P
         mask_bits = 0
@@ -390,8 +505,8 @@ class Bot(AkagiBot):
             "q_values": q_values,
             "mask_bits": mask_bits,
         }
-        if analysis.analysis_text:
-            meta["analysis"] = analysis.analysis_text
+        if analysis_text:
+            meta["analysis"] = analysis_text
         return meta
 
     def _build_helper_melds(self) -> list[str]:
@@ -457,17 +572,18 @@ class Bot(AkagiBot):
     def _call_option_key(
         self,
         option: CallOption,
-        base_shanten: int,
+        base_shanten: Optional[int],
         preferred_call_type: Optional[str],
     ) -> tuple[int, int, float, float]:
-        shanten = option.shanten if option.shanten is not None else base_shanten + 2
+        base = base_shanten if base_shanten is not None else 8
+        shanten = option.shanten if option.shanten is not None else base + 2
         prefer = 1 if preferred_call_type and option.call_type == preferred_call_type else 0
         return (shanten, -prefer, -option.rank, -option.score)
 
     def _call_action_scores(
         self,
         options: list[CallOption],
-        base_shanten: int,
+        base_shanten: Optional[int],
         called_tile: str,
     ) -> dict[str, float]:
         scores: dict[str, float] = {}
@@ -493,8 +609,10 @@ class Bot(AkagiBot):
                 score = option.rank
             else:
                 score = 0.0
-            if option.shanten is not None:
+            if option.shanten is not None and base_shanten is not None:
                 score += (base_shanten - option.shanten) * 100.0
+            if action_key in ("pon", "kan_select") and self.is_yakuhai(called_tile):
+                score += YAKUHAI_CALL_BONUS
             if action_key not in scores or score > scores[action_key]:
                 scores[action_key] = score
         return scores
@@ -612,6 +730,108 @@ class Bot(AkagiBot):
         if not self.can_discard:
             return False
         return "N" in self.tehai_mjai
+
+    def _resolve_call_base_shanten(
+        self,
+        analysis: CallAnalysis,
+        hand_tiles: list[str],
+        melds: list[str],
+        dora_tiles: list[str],
+    ) -> Optional[int]:
+        if analysis.base_shanten is not None:
+            return analysis.base_shanten
+        base = self._engine.analyze_discard(
+            hand_tiles,
+            melds=melds,
+            dora_tiles=dora_tiles,
+        )
+        if base.best_shanten is not None:
+            return base.best_shanten
+        return self.shanten
+
+    def _yakuhai_tiles(self) -> set[str]:
+        tiles = {"P", "F", "C", self.jikaze, self.bakaze}
+        return {tile for tile in tiles if tile}
+
+    def _yakuhai_pair_tiles(self, hand_tiles: list[str]) -> set[str]:
+        yakuhai = self._yakuhai_tiles()
+        counts: dict[str, int] = {}
+        for tile in hand_tiles:
+            kind = _tile_kind(tile)
+            if kind in yakuhai:
+                counts[kind] = counts.get(kind, 0) + 1
+        return {tile for tile, count in counts.items() if count >= 2}
+
+    def _turn_count(self) -> int:
+        return len(self._discards_by_player.get(self.player_id, []))
+
+    def _yaku_category(self, cand: DiscardCandidate) -> int:
+        tags = [tag for tag in cand.yaku_tags if tag not in ("宝牌", "无役")]
+        if "无役" in cand.yaku_tags or not tags:
+            return 0
+        if set(tags) == {"役牌"}:
+            return 1
+        return 2
+
+    def _discard_focus_kinds(self, hand_tiles: list[str]) -> tuple[set[str], set[str]]:
+        yakuhai = self._yakuhai_tiles()
+        honor_counts: dict[str, int] = {}
+        suit_counts: dict[str, dict[int, int]] = {suit: {i: 0 for i in range(1, 10)} for suit in ("m", "p", "s")}
+
+        for tile in hand_tiles:
+            kind = _tile_kind(tile)
+            if kind in ("E", "S", "W", "N", "P", "F", "C"):
+                honor_counts[kind] = honor_counts.get(kind, 0) + 1
+                continue
+            if len(kind) >= 2 and kind[1] in ("m", "p", "s"):
+                num = _tile_number(kind)
+                if num is not None:
+                    suit_counts[kind[1]][num] += 1
+
+        garbage: set[str] = set()
+        soft_garbage: set[str] = set()
+
+        for honor, count in honor_counts.items():
+            if honor in yakuhai:
+                continue
+            if count == 1:
+                garbage.add(honor)
+            elif count >= 2:
+                soft_garbage.add(honor)
+
+        for suit, counts in suit_counts.items():
+            for num, count in counts.items():
+                if count <= 0:
+                    continue
+                if not self._is_isolated_number(num, counts):
+                    continue
+                kind = f"{num}{suit}"
+                if num in (1, 9):
+                    garbage.add(kind)
+                elif num in (2, 8):
+                    soft_garbage.add(kind)
+
+        return garbage, soft_garbage
+
+    def _is_isolated_number(self, num: int, counts: dict[int, int]) -> bool:
+        if counts.get(num, 0) >= 2:
+            return False
+        for delta in (1, 2):
+            if counts.get(num - delta, 0) > 0:
+                return False
+            if counts.get(num + delta, 0) > 0:
+                return False
+        return True
+
+    def _filter_candidates_by_kinds(self, candidates: list[str], kinds: set[str]) -> list[str]:
+        if not kinds:
+            return []
+        return [tile for tile in candidates if _tile_kind(tile) in kinds]
+
+    def _filter_scored_by_kinds(self, candidates: dict[str, float], kinds: set[str]) -> dict[str, float]:
+        if not kinds:
+            return {}
+        return {tile: score for tile, score in candidates.items() if _tile_kind(tile) in kinds}
 
     def _action(self, data: dict) -> str:
         return json.dumps(data, separators=(",", ":"))
