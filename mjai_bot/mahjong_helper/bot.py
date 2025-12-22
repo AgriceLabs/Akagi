@@ -42,6 +42,8 @@ HONOR_DORA_NEXT = {
 YAKUHAI_CALL_BONUS = 80.0
 NO_YAKU_PENALTY = 60.0
 YAKUHAI_ONLY_PENALTY = 25.0
+DORA_DISCARD_PENALTY = 30.0
+RED_DORA_DISCARD_PENALTY = 50.0
 EARLY_CALL_TURN_LIMIT = 5
 RIICHI_DORA_THRESHOLD = 2
 LOW_VALUE_OPEN_YAKU = {"断幺", "混全", "纯全", "混老头"}
@@ -392,6 +394,11 @@ class Bot(AkagiBot):
     ) -> tuple[dict[str, float], Optional[str]]:
         discardable = set(self._discardable_tiles())
         threat_levels = self._threat_levels()
+        dora_kinds = {
+            _tile_kind(tile)
+            for tile in _dora_tiles_from_indicators(self._dora_indicators)
+            if tile
+        }
         yakuhai_pairs = self._yakuhai_pair_tiles(hand_tiles)
         is_open = self._open_melds_by_player.get(self.player_id, 0) > 0
 
@@ -465,6 +472,10 @@ class Bot(AkagiBot):
                     score -= YAKUHAI_ONLY_PENALTY
                 if not use_best_shanten and best_shanten is not None and cand.shanten is not None:
                     score -= (cand.shanten - best_shanten) * SHANTEN_PENALTY
+            if _tile_kind(actual) in dora_kinds:
+                score -= DORA_DISCARD_PENALTY
+            if actual.endswith("r"):
+                score -= RED_DORA_DISCARD_PENALTY
             if defense_ctx is not None:
                 score -= tile_danger(actual, defense_ctx) * defense_weight
             if actual not in candidates or score > candidates[actual]:
